@@ -49,6 +49,11 @@ static DEFINE_MUTEX(client_mutex);
 static LIST_HEAD(component_list);
 static LIST_HEAD(unbind_card_list);
 
+#ifdef CONFIG_DEBUG_FS
+static LIST_HEAD(visited_widget_list);
+static LIST_HEAD(visited_path_list);
+#endif
+
 #define for_each_component(component)			\
 	list_for_each_entry(component, &component_list, list)
 
@@ -189,12 +194,159 @@ static int component_list_show(struct seq_file *m, void *v)
 }
 DEFINE_SHOW_ATTRIBUTE(component_list);
 
+static bool is_widget_visited(struct snd_soc_dapm_widget *w) {
+	struct snd_soc_dapm_widget *p;
+
+	list_for_each_entry(p, &visited_widget_list, visited_list) {
+		if (p == w) {
+			return true;
+		} else if (!strcmp(p->name, w->name)) {
+			pr_err("p != w but names match: p = %s, w = %s", p->name, w->name);
+		}
+	}
+
+	return false;
+}
+
+static bool is_path_visited(struct snd_soc_dapm_path *p) {
+	struct snd_soc_dapm_path *t;
+
+	list_for_each_entry(t, &visited_path_list, visited_list) {
+		pr_info("Comparing %px %s (%s -> %s) to  %px %s (%s -> %s)", p, p->name,
+			p->source->name, p->sink->name, t, t->name,
+			t->source->name, t->sink->name);
+		if (t->name == p->name && t->source == p->source && t->sink == p->sink) {
+			pr_info("MATCH");
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void soc_dapm_graph_show_widget(struct seq_file *s, struct snd_soc_dapm_widget *w,
+	struct snd_soc_dai *dai)
+{
+	//FIXME: get string for widget id (it's snd_soc_dapm_type)
+	seq_printf(s, "\t\t\"%s:%d\" [label=\"%s\n",
+		w->name, w->id, dai ? dai->name : w->name);
+
+	seq_printf(s, "\t\t\t|%s", w->power ? "Powered" : "Unpowered");
+	if (w->sname)
+		seq_printf(s, "\n\t\t\t|Stream: %s", w->sname);
+
+	seq_printf(s, "\",\n\t\t\tstyle=filled, fillcolor=%s]\n",
+		w->power ? "green3" : (dai ? "yellow" : "white"));
+
+	list_add_tail(&w->visited_list, &visited_widget_list);
+}
+
+static void soc_dapm_graph_show_widgets_locked(struct seq_file *s,
+	struct snd_soc_dapm_widget *start, int dir)
+{
+	struct snd_soc_dapm_path *p;
+	struct snd_soc_dapm_widget *node;
+	bool connected = false;
+	bool source_visited = false;
+	bool sink_visited = false;
+
+	snd_soc_dapm_widget_for_each_path(start, dir, p) {
+		if (p->is_supply || is_path_visited(p))
+			continue;
+
+		connected = p->connect || (p->connected && p->connected(p->source, p->sink));
+
+		node = p->node[dir ? SND_SOC_DAPM_DIR_IN : SND_SOC_DAPM_DIR_OUT];
+
+		soc_dapm_graph_show_widgets_locked(s, node, dir);
+		dev_info(snd_soc_dapm_to_dev(node->dapm), "w: %s --(%s)-> %s\n",
+			p->node[dir]->name, p->name, node->name);
+
+		seq_printf(s, "\t\t\"%s:%d\" -> \"%s:%d\" [",
+			p->source->name, p->source->id,
+			p->sink->name, p->sink->id);
+		if (p->name && connected)
+			seq_printf(s, "label=\"%s\"", p->name);
+		seq_printf(s, "%s]\n",
+			(connected ? "color=dodgerblue2"
+			: "style=dashed penwidth=0.2"));
+
+		if (!is_widget_visited(node))
+			soc_dapm_graph_show_widget(s, node, NULL);
+
+		list_add_tail(&p->visited_list, &visited_path_list);
+	}
+}
+
+static void soc_dapm_graph_show_widgets(struct seq_file *s,
+	struct snd_soc_dapm_widget *start, int dir)
+{
+	struct snd_soc_card *card = snd_soc_dapm_to_card(start->dapm);
+
+	mutex_lock(&card->dapm_mutex);
+
+	pr_info("%s: start widget: %s\n", __func__, start->name);
+
+	soc_dapm_graph_show_widgets_locked(s, start, dir);
+
+	mutex_unlock(&card->dapm_mutex);
+}
+
+static int soc_dapm_graph_show(struct seq_file *s, void *v)
+{
+	struct snd_soc_card *card = s->private;
+	struct snd_soc_component *component;
+	struct snd_soc_dai *dai;
+	int dir, i = 0;
+
+	seq_puts(s, "strict digraph {\n\trankdir = LR\n\tnode [shape = Mrecord]\n");
+
+	mutex_lock(&client_mutex);
+
+	for_each_component(component) {
+		if (!component || component->card != card) {
+			continue;
+		}
+
+		seq_printf(s, "\tsubgraph component_%d {\n", ++i);
+		seq_printf(s, "\t\tlabel = \"%s\"\n", component->name);
+		pr_info("%s: label\n", __func__);
+		for_each_component_dais(component, dai) {
+			if (!dai)
+				continue;
+			for_each_pcm_streams(dir) {
+				struct snd_soc_dapm_widget *dai_w;
+				if (!snd_soc_dai_stream_valid(dai, dir) || !dai)
+					continue;
+				pr_info("%s: dai=%s", __func__, dai->name);
+				// dai_w = dir == SNDRV_PCM_STREAM_PLAYBACK ?
+				// 	dai->playback_widget : dai->capture_widget;
+				dai_w = dai->stream[dir].widget;
+				soc_dapm_graph_show_widget(s, dai_w, dai);
+				soc_dapm_graph_show_widgets(s, dai_w, dir);
+			}
+		}
+		seq_printf(s, "\t}\n");
+	}
+
+	seq_printf(s, "}\n");
+
+	mutex_unlock(&client_mutex);
+
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(soc_dapm_graph);
+
 static void soc_init_card_debugfs(struct snd_soc_card *card)
 {
 	card->debugfs_card_root = debugfs_create_dir(card->name,
 						     snd_soc_debugfs_root);
 
 	snd_soc_dapm_debugfs_init(snd_soc_card_to_dapm(card), card->debugfs_card_root);
+
+	debugfs_create_file("dapm_graph", 0444, card->debugfs_card_root, card,
+			    &soc_dapm_graph_fops);
 }
 
 static void soc_cleanup_card_debugfs(struct snd_soc_card *card)

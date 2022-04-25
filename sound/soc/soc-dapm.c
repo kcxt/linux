@@ -2587,6 +2587,8 @@ static void dapm_debugfs_add_widget(struct snd_soc_dapm_widget *w)
 
 	if (!dapm->debugfs_dapm || !w->name)
 		return;
+	
+	INIT_LIST_HEAD(&w->visited_list);
 
 	debugfs_create_file(w->name, 0444, dapm->debugfs_dapm, w,
 			    &dapm_widget_power_fops);
